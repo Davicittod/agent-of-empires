@@ -22,6 +22,12 @@ pub struct WorktreeEntry {
 
 pub struct GitWorktree {
     pub repo_path: PathBuf,
+    /// Whether `create_worktree` should run `git submodule update --init
+    /// --recursive` when the new checkout contains a `.gitmodules` file.
+    /// Defaults to true to preserve the behavior introduced in #942; callers
+    /// that respect a user-facing setting (see `WorktreeConfig::init_submodules`)
+    /// should call `with_init_submodules` to override it per session.
+    init_submodules: bool,
 }
 
 impl GitWorktree {
@@ -29,7 +35,17 @@ impl GitWorktree {
         if !Self::is_git_repo(&repo_path) {
             return Err(GitError::NotAGitRepo);
         }
-        Ok(Self { repo_path })
+        Ok(Self {
+            repo_path,
+            init_submodules: true,
+        })
+    }
+
+    /// Configure whether `create_worktree` recursively initializes submodules
+    /// for the new checkout. Defaults to true.
+    pub fn with_init_submodules(mut self, init_submodules: bool) -> Self {
+        self.init_submodules = init_submodules;
+        self
     }
 
     pub fn is_git_repo(path: &Path) -> bool {
@@ -400,7 +416,11 @@ impl GitWorktree {
         );
 
         let t = std::time::Instant::now();
-        let submodule_status = Self::initialize_submodules(path)?;
+        let submodule_status = if self.init_submodules {
+            Self::initialize_submodules(path)?
+        } else {
+            "disabled-by-config".to_string()
+        };
         tracing::info!(
             "worktree create: submodules ({}) done in {:?}",
             submodule_status,
@@ -2058,8 +2078,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_create_worktree_initializes_submodules() {
+    /// Build a main repo with a single submodule served by a `git daemon`
+    /// fixture, then create a `test-feature` branch on its current HEAD.
+    /// Returns the `TempDir` containers, the daemon guard (must stay alive
+    /// for `git submodule update` to reach the URL), and the repo path.
+    ///
+    /// The submodule is added at `.claude/` and contains a `skill.md` file,
+    /// so tests can assert on `wt_path.join(".claude").join("skill.md")` to
+    /// distinguish "submodule initialized" from "only .gitmodules checked
+    /// out".
+    fn build_repo_with_submodule_and_branch(
+        branch: &str,
+    ) -> (TempDir, TempDir, GitDaemonGuard, TempDir) {
         let submodule_src_dir = TempDir::new().unwrap();
         let submodule_repo = git2::Repository::init(submodule_src_dir.path()).unwrap();
         let sig = git2::Signature::now("Test", "test@example.com").unwrap();
@@ -2096,7 +2126,7 @@ mod tests {
                 "submodule.git",
             ],
         );
-        let (_daemon, submodule_url) = spawn_git_daemon(daemon_root.path(), "submodule.git");
+        let (daemon, submodule_url) = spawn_git_daemon(daemon_root.path(), "submodule.git");
 
         let repo_dir = TempDir::new().unwrap();
         let repo = git2::Repository::init(repo_dir.path()).unwrap();
@@ -2126,12 +2156,19 @@ mod tests {
             repo_dir.path(),
             &["submodule", "add", &submodule_url, ".claude"],
         );
-
         run_git(repo_dir.path(), &["commit", "-am", "Add submodule"]);
 
         let repo = git2::Repository::open(repo_dir.path()).unwrap();
         let head_commit = repo.head().unwrap().peel_to_commit().unwrap();
-        repo.branch("test-feature", &head_commit, false).unwrap();
+        repo.branch(branch, &head_commit, false).unwrap();
+
+        (submodule_src_dir, daemon_root, daemon, repo_dir)
+    }
+
+    #[test]
+    fn test_create_worktree_initializes_submodules() {
+        let (_submodule_src, _daemon_root, _daemon, repo_dir) =
+            build_repo_with_submodule_and_branch("test-feature");
 
         let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
         let worktree_parent = TempDir::new().unwrap();
@@ -2143,6 +2180,36 @@ mod tests {
         assert!(
             wt_path.join(".claude").join("skill.md").is_file(),
             "submodule contents should be initialized in the new worktree"
+        );
+    }
+
+    #[test]
+    fn test_create_worktree_skips_submodules_when_disabled() {
+        // with_init_submodules(false) must skip the `git submodule update`
+        // step entirely so the worktree shows up before submodules clone.
+        let (_submodule_src, _daemon_root, _daemon, repo_dir) =
+            build_repo_with_submodule_and_branch("test-feature");
+
+        let git_wt = GitWorktree::new(repo_dir.path().to_path_buf())
+            .unwrap()
+            .with_init_submodules(false);
+        let worktree_parent = TempDir::new().unwrap();
+        let wt_path = worktree_parent.path().join("submodule-worktree");
+        git_wt
+            .create_worktree("test-feature", &wt_path, false)
+            .unwrap();
+
+        assert!(
+            wt_path.join(".git").exists(),
+            "worktree itself should still be created"
+        );
+        assert!(
+            wt_path.join(".gitmodules").is_file(),
+            ".gitmodules should be checked out from the parent commit"
+        );
+        assert!(
+            !wt_path.join(".claude").join("skill.md").is_file(),
+            "submodule contents must NOT be initialized when init_submodules=false"
         );
     }
 
