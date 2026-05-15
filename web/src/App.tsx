@@ -66,6 +66,7 @@ import {
 import { AboutModal } from "./components/AboutModal";
 import { CommandPalette } from "./components/command-palette/CommandPalette";
 import { DisconnectBanner } from "./components/DisconnectBanner";
+import { ElevationPrompt } from "./components/ElevationPrompt";
 import { UpdateBanner } from "./components/UpdateBanner";
 
 const RIGHT_PANEL_COLLAPSED_KEY = "aoe-right-collapsed";
@@ -145,6 +146,7 @@ export default function App() {
   return (
     <IdleDecayWindowContext.Provider value={idleDecayWindowMs}>
       <AppContent loginRequired={loginRequired} onLogout={handleLogout} />
+      <ElevationPrompt />
     </IdleDecayWindowContext.Provider>
   );
 }

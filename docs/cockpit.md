@@ -270,6 +270,22 @@ when the approval card itself has focus. Typing "always allow" into
 the composer will never silently approve a pending tool; the
 composer captures every keystroke, including those letters.
 
+### Web composer Enter behavior
+
+On desktop, Enter sends the prompt and Shift+Enter inserts a
+newline, matching the TUI convention above.
+
+On touch-primary devices (phones, tablets without an attached
+keyboard), plain Enter inserts a newline and the explicit Send
+button on the right of the composer is the only path to dispatch.
+This matches the conventions of WhatsApp, Slack, ChatGPT mobile,
+and Claude.ai mobile, and avoids the common foot-gun of accidentally
+firing a partial multi-line prompt by reaching for a line break.
+An iPad with a Bluetooth keyboard (or any device that reports both
+`(pointer: coarse)` and `(any-pointer: fine)` to the browser) keeps
+the desktop Enter-to-send convention so hardware-keyboard typing
+feels natural. See #1129.
+
 ### Cross-machine attach
 
 Set `AOE_DAEMON_URL` (and optionally `AOE_DAEMON_TOKEN`) to point at
@@ -397,6 +413,17 @@ restoration (Claude today), the model itself also retains conversation
 context across restarts; so a follow-up like "what did we just
 decide?" still works after a daemon restart.
 
+The web dashboard mirrors each session's reduced state into
+`localStorage` under the `aoe:cockpit-state:v1:<session_id>` key so a
+full page reload (mobile OS evicting the tab, Cloudflare tunnel
+re-auth, PWA cold start) hydrates the chat surface instantly from the
+last-known state and only fetches the seq-delta from the server. Entries
+expire after seven days; an oversized session that exceeds the
+per-origin quota falls back to the full server replay path without
+warning. `clearCockpitCache` and the session-delete handler drop the
+matching entry so a freshly-recreated session id doesn't briefly show
+the prior transcript.
+
 If context restoration fails (e.g., the agent's stored session is no
 longer available), cockpit falls back to a fresh session and renders
 an amber "Conversation context reset" callout in the transcript so
@@ -513,6 +540,44 @@ Reinstalling the adapter does not help here; the adapter is fine, the cwd is gon
   longer holds events that far back, you'll see a `History
   truncated` notice and reloading is the cleanest way to resync.
 
+### Editing settings asks for the passphrase again
+
+When passphrase login is configured, the daily-use cockpit flows
+(sending prompts, cancelling turns, resolving approvals, switching
+mode, restarting workers, attaching terminals) do NOT prompt for the
+passphrase again. Your session cookie plus the device-binding
+secret are sufficient, the same way an SSH session stays open after
+the initial authentication. See #1137.
+
+Editing the persisted config IS gated. Saving the global settings
+panel, creating / deleting / renaming a profile, editing a profile's
+settings, or changing the default profile requires that your login
+session has been "elevated" within the last 15 minutes via `POST
+/api/login/elevate`. The first such action after a fresh page load
+surfaces an inline passphrase prompt; subsequent edits inside the
+same 15-minute window go through without re-prompting. The narrow
+scope catches the persisted-tamper attack (an attacker with stolen
+session + binding plants a malicious Docker image, worktree
+template, or profile, then waits for the owner to spawn a session
+that runs it) without putting friction on the conversation surface.
+
+### WebSocket auto-reconnect and keepalive
+
+Mobile browsers and Cloudflare tunnels both close idle WebSocket
+connections aggressively (Chrome / Safari at ~30 to 60 seconds in the
+background, Cloudflare at 100 seconds), so the cockpit pairs an
+application-level keepalive with a client-side reconnect envelope.
+The server sends a Ping every 30 seconds and reaps any socket that
+goes 90 seconds without a Pong reply. On the client, the
+`useCockpit` hook re-dials the WebSocket on close with exponential
+backoff (1s, 2s, 4s, 8s, 16s, 30s, 30s), reset on the next successful
+`onopen`. The reconnect resumes from `?since={lastSeq}` so the
+transcript stays continuous. The cockpit banner shows
+`Reconnecting (N/7) in Xs...` while the auto-retry is armed, and a
+manual **Reconnect** button after the seven attempts exhaust.
+`visibilitychange`, `online`, and `pageshow` listeners trigger an
+immediate reconnect when the tab returns to the foreground.
+
 ### Approval card vanished without resolving
 
 Approvals expire after `approval_timeout_secs` (default 300). The
@@ -524,12 +589,19 @@ context where approvals legitimately take longer.
 
 When you run `/clear` in a cockpit session, the model's context is
 wiped on the adapter side but the visible transcript is preserved.
-The cockpit now appends a "Conversation cleared" divider, drops the
-cached slash-command / mode / plan state (the model has forgotten
-them), and folds every row above the divider behind a disclosure
-banner: `Show N earlier turns (cleared, not in the model's memory)`.
-Click the banner to expand the older transcript for your own
-reference; the model still won't see those turns. See #1101.
+The cockpit appends a "Conversation cleared" divider, resets the
+active plan, the current mode, any in-flight approvals, and the
+session usage snapshot, then folds every row above the divider
+behind a disclosure banner: `Show N earlier turns (cleared, not in
+the model's memory)`. Click the banner to expand the older transcript
+for your own reference; the model still won't see those turns. See
+#1101.
+
+The slash-command palette and mode picker stay populated across a
+`/clear`. `claude-agent-sdk` caches the supported command surface at
+Query init and does not rotate it when conversation context is reset,
+so the cached list stays authoritative for the lifetime of the
+cockpit's underlying agent process. See #1128.
 
 ### "Force end turn" button under the spinner
 
