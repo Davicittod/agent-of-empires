@@ -50,7 +50,7 @@ Push notifications on iOS require the dashboard to be installed as a Home Screen
 4. Open the app from your Home Screen (not from Safari).
 5. Go to Settings in the app.
 6. In the Notifications section, tap *Enable notifications* and grant permission when iOS asks.
-7. Tap *Send test notification*. A test notification should appear on your Lock Screen within a few seconds.
+7. Tap *Send test notification*. The server waits a few seconds before firing the push so you have time to lock your phone; the notification should then appear on your Lock Screen.
 
 If the test does not appear:
 - Make sure the app was opened from the Home Screen, not Safari.
@@ -63,7 +63,7 @@ If the test does not appear:
 1. Open the dashboard URL.
 2. Go to Settings. In the Notifications section, click *Enable notifications*.
 3. Grant permission when the browser asks.
-4. Click *Send test notification*.
+4. Click *Send test notification*. The server waits a few seconds before firing, so the notification arrives shortly after the click.
 
 Desktop Safari requires macOS 13 or later and does not require the PWA install step.
 
