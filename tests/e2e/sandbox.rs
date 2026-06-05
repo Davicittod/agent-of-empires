@@ -5,7 +5,7 @@ use crate::harness::TuiTestHarness;
 /// Exercises `aoe add --sandbox` which builds the full container config.
 /// This would have caught the duplicate mount points bug (commit 92d2e53).
 ///
-/// Requires a running Docker daemon -- marked `#[ignore]` for CI.
+/// Requires a running Docker daemon; marked `#[ignore]` for CI.
 #[test]
 #[serial]
 #[ignore = "requires Docker daemon"]
@@ -44,7 +44,7 @@ fn test_cli_add_with_sandbox() {
 /// `HookTarget::Local`, ignoring `sandbox_info`. The TUI already handled this
 /// correctly via `execute_hooks_in_container_streamed`.
 ///
-/// Requires a running Docker daemon -- marked `#[ignore]` for CI.
+/// Requires a running Docker daemon; marked `#[ignore]` for CI.
 #[test]
 #[serial]
 #[ignore = "requires Docker daemon"]
