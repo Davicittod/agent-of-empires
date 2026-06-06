@@ -814,14 +814,14 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 if instance.sandbox_info.is_some() {
                     instance.get_container_for_instance()?;
                     let workdir = instance.container_workdir();
-                    let container_name =
-                        instance.sandbox_info.as_ref().unwrap().container_name.as_str();
-                    repo_config::execute_hooks_in_container(
-                        &hooks.on_create,
-                        container_name,
-                        &workdir,
-                        &hook_env,
-                    )?;
+                    if let Some(ref sandbox) = instance.sandbox_info {
+                        repo_config::execute_hooks_in_container(
+                            &hooks.on_create,
+                            &sandbox.container_name,
+                            &workdir,
+                            &hook_env,
+                        )?;
+                    }
                 } else {
                     repo_config::execute_hooks(&hooks.on_create, &path, &hook_env)?;
                 }
