@@ -1065,6 +1065,11 @@ pub(super) fn apply_post_restart_identity_sync(
     if started.lifecycle_generation < live.lifecycle_generation {
         return;
     }
+    // The snapshot describes the agent it launched, and a swap moves neither the lifecycle counter
+    // nor the capture generation: applying it would resolve this row's capture from another agent.
+    if started.tool != live.tool {
+        return;
+    }
     // A same-SID publication can still replace the native store or transcript.
     let generation_can_merge = live.omp_capture_generation == before.omp_capture_generation
         || live.omp_capture_generation == started.omp_capture_generation;
@@ -1074,17 +1079,11 @@ pub(super) fn apply_post_restart_identity_sync(
         live.omp_capture_generation = started.omp_capture_generation.clone();
         if conversation_unchanged {
             live.adopt_conversation_state(started.conversation_state());
+        } else {
+            live.adopt_active_execution(started);
         }
     }
-    if live.active_execution == started.active_execution {
-        live.session_id_poller = started.session_id_poller.clone();
-        live.session_id_poller_retry_after = started.session_id_poller_retry_after;
-        if started.session_id_poller_is_running() {
-            live.poller_repair.reset();
-        }
-    } else {
-        started.stop_poller();
-    }
+    live.adopt_relaunch_poller_state(before, started);
     if generation_can_merge && marker_unchanged && live.agent_session_id == started.agent_session_id
     {
         live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();

@@ -2416,14 +2416,22 @@ impl Instance {
     }
 
     pub(crate) fn adopt_conversation_state(&mut self, state: ConversationState) {
-        if self.active_execution != state.active {
-            self.stop_poller();
-            self.session_id_poller = None;
-        }
+        self.settle_poller_for(state.active.as_ref());
         self.set_agent_conversation(state.session_id, state.binding, state.pi_session_path);
         self.resume_intent = state.intent;
         self.resume_binding = state.resume_binding;
         self.active_execution = state.active;
+    }
+
+    /// Take on the execution `src` launched, settling the session-id poller with it.
+    ///
+    /// A poller is only usable by a row holding the execution it was installed for: the drain
+    /// erases an observation that names another execution, and a launch-scoped one reads the
+    /// other launch's file. A poller for another execution is stopped here; the repair walk
+    /// installs one for this pane once the relaunch that stamped it says the pane is new.
+    pub(crate) fn adopt_active_execution(&mut self, src: &Self) {
+        self.settle_poller_for(src.active_execution.as_ref());
+        self.active_execution = src.active_execution.clone();
     }
 
     pub(super) fn capture_store_dir(&self) -> Option<PathBuf> {

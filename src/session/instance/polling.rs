@@ -4,7 +4,45 @@ use super::*;
 use fs2::FileExt as _;
 use sha2::{Digest as _, Sha256};
 
-const MANAGED_CAPTURE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+use crate::session::poller::MANAGED_CAPTURE_RETRY_BACKOFF;
+
+/// Lets a test hold the start path open long enough to observe that the repair
+/// schedule is stamped after it, the way a wedged `tmux` does.
+#[cfg(test)]
+pub(super) mod probe_delay {
+    thread_local! {
+        static DELAY: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(in crate::session::instance) struct ProbeDelay;
+
+    impl ProbeDelay {
+        pub(in crate::session::instance) fn install(delay: impl Fn() + 'static) -> Self {
+            DELAY.with(|slot| {
+                assert!(slot.borrow().is_none(), "one probe delay per test thread");
+                *slot.borrow_mut() = Some(Box::new(delay));
+            });
+            Self
+        }
+    }
+
+    impl Drop for ProbeDelay {
+        fn drop(&mut self) {
+            DELAY.with(|slot| {
+                slot.borrow_mut().take();
+            });
+        }
+    }
+
+    pub(super) fn hold() {
+        DELAY.with(|slot| {
+            if let Some(delay) = slot.borrow().as_ref() {
+                delay();
+            }
+        });
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -272,12 +310,19 @@ impl Instance {
         &mut self,
         omp_metadata: Option<OmpCaptureMetadata>,
     ) -> PollerStart {
+        #[cfg(test)]
+        probe_delay::hold();
         if !crate::migrations::v033_isolate_sandbox_content::instance_ready(self).unwrap_or(false) {
             self.session_id_poller = None;
             return PollerStart::NotApplicable;
         }
         if self.session_id_poller_is_running() {
-            return PollerStart::Started;
+            if self.poller_serves(&self.tool, self.active_execution.as_ref()) {
+                return PollerStart::Started;
+            }
+            // A launch can replace the execution without tearing the poller down first, and the
+            // row would then keep a watcher for the launch it just gave up.
+            self.stop_poller();
         }
         self.session_id_poller = None;
         let Some((capture, context)) = self.source_session_support() else {
@@ -416,7 +461,11 @@ impl Instance {
             None
         };
 
-        let mut poller = SessionPoller::new(tmux_session_name);
+        let mut poller = SessionPoller::new(
+            tmux_session_name,
+            self.tool.clone(),
+            self.active_execution.clone(),
+        );
         let instance_id = self.id.clone();
         let initial_known = self.agent_session_id.clone().filter(|_| {
             self.agent_session_binding
@@ -624,6 +673,74 @@ impl Instance {
         self.install_poller(poller, spawn)
     }
 
+    /// Whether this row runs `tool` on `execution`. State stamped for another agent or another
+    /// launch describes a row this one no longer is: a swap moves neither the lifecycle counter nor
+    /// the capture generation, so nothing else would say the two are different rows.
+    pub(crate) fn runs(&self, tool: &str, execution: Option<&ActiveExecution>) -> bool {
+        self.tool == tool && self.active_execution.as_ref() == execution
+    }
+
+    /// Whether the poller this row holds watches `tool` on `execution`, which is what the row is
+    /// taking on. A row with no poller has none to watch, whatever it used to hold.
+    pub(crate) fn poller_serves(&self, tool: &str, execution: Option<&ActiveExecution>) -> bool {
+        self.session_id_poller.as_ref().is_some_and(|poller| {
+            poller
+                .lock()
+                .map(|guard| guard.serves(tool, execution))
+                .unwrap_or_else(|poisoned| poisoned.into_inner().serves(tool, execution))
+        })
+    }
+
+    /// Take the poller a handoff offers. A poller serves the execution it was installed for, so the
+    /// row takes the handle only when it watches the execution the row now holds, and one that does
+    /// not is stopped: its thread still reads the launch the row is giving up.
+    ///
+    /// Call once the row's own execution is settled, which is what the handoff may replace: asked
+    /// against the execution the row still held, it would refuse the handoff's poller and stop it.
+    pub(crate) fn adopt_poller(&mut self, handoff: &Self) {
+        if handoff.poller_serves(&self.tool, self.active_execution.as_ref()) {
+            self.session_id_poller = handoff.session_id_poller.clone();
+        } else {
+            handoff.stop_poller();
+        }
+    }
+
+    /// Take the row's repair pacing from a prior row about the same execution: the re-probe ladder
+    /// and the managed-store deadline, both of which hold the next attempt back. Neither depends
+    /// on a poller, so a row with nothing to poll keeps its window, and a row whose execution
+    /// another process replaced does not inherit a window armed for the old one.
+    pub(crate) fn adopt_poller_repair(&mut self, prior: &Self) {
+        if self.runs(&prior.tool, prior.active_execution.as_ref()) {
+            self.poller_repair = prior.poller_repair.clone();
+            self.session_id_poller_retry_after = prior.session_id_poller_retry_after;
+        }
+    }
+
+    /// Keep the poller only while it watches `execution`, and clear the slot otherwise. A poller
+    /// for another execution reads files the row no longer owns, so its thread stops here rather
+    /// than being reported as a start for this row.
+    pub(crate) fn settle_poller_for(&mut self, execution: Option<&ActiveExecution>) {
+        if !self.poller_serves(&self.tool, execution) {
+            self.stop_poller();
+            self.session_id_poller = None;
+        }
+    }
+
+    /// Take everything a relaunch offers the row's poller state: the handle, and the timing the
+    /// launch measured for the execution the row now holds. Both timing writes share one gate,
+    /// because a launch only speaks for the row once it stamped its start, which it does after
+    /// re-evaluating the row's capture. An unstamped launch has not re-evaluated anything, and a
+    /// launch whose execution the row refused speaks for a pane this row does not have.
+    pub(crate) fn adopt_relaunch_poller_state(&mut self, before: &Self, launched: &Self) {
+        self.adopt_poller(launched);
+        if launched.last_start_time != before.last_start_time
+            && self.runs(&launched.tool, launched.active_execution.as_ref())
+        {
+            self.poller_repair.reset();
+            self.session_id_poller_retry_after = launched.session_id_poller_retry_after;
+        }
+    }
+
     pub(crate) fn session_id_poller_is_running(&self) -> bool {
         self.session_id_poller.as_ref().is_some_and(|poller| {
             poller
@@ -656,23 +773,31 @@ impl Instance {
         if !self.supports_session_poller() {
             return false;
         }
-        let repair_now = std::time::Instant::now();
         self.session_id_poller = None;
-        match self.maybe_start_poller() {
+        let outcome = self.maybe_start_poller();
+        // Sampled after the attempt: a probe can outlast its own delay, and a deadline stamped
+        // from before it would already be due on the next tick.
+        let after = std::time::Instant::now();
+        match outcome {
             // `install_poller` cleared the schedule.
             PollerStart::Started => true,
-            // Nothing failed: the session has nothing to poll right now, or the managed store's own
-            // retry deadline governs.
-            PollerStart::NotApplicable | PollerStart::Deferred => {
+            // Not a failure, but the probe is not free, so the row re-probes on a schedule of
+            // its own rather than every tick (#4137).
+            PollerStart::NotApplicable => {
+                self.poller_repair.reprobe(after);
+                false
+            }
+            // The managed store's own retry deadline governs this outcome.
+            PollerStart::Deferred => {
                 self.poller_repair.reset();
                 false
             }
             PollerStart::BudgetExhausted => {
-                self.defer_poller_repair(repair_now, "budget exhausted");
+                self.defer_poller_repair(after, "budget exhausted");
                 false
             }
             PollerStart::SpawnFailed => {
-                self.defer_poller_repair(repair_now, "start failed");
+                self.defer_poller_repair(after, "start failed");
                 false
             }
         }
@@ -872,10 +997,60 @@ mod tests {
         inst.stop_poller();
     }
 
-    /// A live pane with nothing to poll right now (here: an OMP pane whose capture metadata is not
-    /// resolvable) is not a failed spawn.
+    /// The window is stamped from after the attempt, so a probe that outlasts it cannot leave
+    /// the row due again on the next tick.
     #[test]
-    fn repair_does_not_defer_a_session_with_nothing_to_poll() {
+    #[serial_test::serial]
+    fn a_slow_probe_still_arms_a_window_that_has_not_expired() {
+        let _isolated = crate::session::test_support::isolate_app_dir();
+        let mut inst = Instance::new("slow-probe", "/tmp/slow-probe");
+        inst.tool = "omp".to_string();
+        inst.omp_capture_generation = Some("gen-1".to_string());
+        let live = crate::tmux::LiveSessionSnapshot::from_parts(
+            Some(vec![crate::tmux::Session::generate_name(
+                &inst.id,
+                &inst.title,
+            )]),
+            None,
+        );
+        assert!(inst.has_live_agent_pane_in(&live));
+
+        let probing = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mark = probing.clone();
+        let _delay = super::probe_delay::ProbeDelay::install(move || {
+            *mark.lock().unwrap() = Some(std::time::Instant::now());
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        });
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        let armed = inst
+            .poller_repair
+            .armed_at()
+            .expect("a re-probe arms a deadline");
+        assert!(
+            !inst.poller_repair.due(std::time::Instant::now()),
+            "the armed window has not expired"
+        );
+        let probing = probing.lock().unwrap().expect("the start path ran");
+        assert_eq!(
+            inst.poller_repair.current_reprobe_delay(),
+            Some(std::time::Duration::from_secs(5)),
+            "a re-probe arms its own ladder, not the failure one"
+        );
+        assert!(
+            armed >= probing + std::time::Duration::from_secs(5),
+            "the deadline is counted from the end of the attempt, not from before it: {:?} since \
+             the probe began",
+            armed.duration_since(probing)
+        );
+    }
+
+    /// A live pane with nothing to poll right now (here: an OMP pane whose capture metadata is not
+    /// resolvable) is not a failed spawn, but the probe was not free either, so the next one
+    /// waits (#4137).
+    #[test]
+    #[serial_test::serial]
+    fn repair_reprobes_a_session_with_nothing_to_poll() {
+        let _isolated = crate::session::test_support::isolate_app_dir();
         let mut inst = Instance::new("omp-no-meta", "/tmp/omp-no-meta");
         inst.tool = "omp".to_string();
         inst.omp_capture_generation = Some("gen-1".to_string());
@@ -886,7 +1061,7 @@ mod tests {
             )]),
             None,
         );
-        assert!(inst.has_live_tmux_pane_in(&live));
+        assert!(inst.has_live_agent_pane_in(&live));
         assert!(
             inst.supports_session_poller(),
             "OMP is pollable in principle, so repair walks the start path"
@@ -895,15 +1070,34 @@ mod tests {
 
         assert!(!inst.repair_session_id_poller_if_needed(&live));
         assert!(inst.session_id_poller.is_none());
+        assert!(
+            !inst.poller_repair.due(std::time::Instant::now()),
+            "the next probe is scheduled, not the next tick"
+        );
         assert_eq!(
             inst.poller_repair.deferrals(),
             0,
-            "nothing to poll is not a failed repair"
+            "nothing to poll is not counted as a failed repair"
         );
         assert!(
-            inst.poller_repair.due(std::time::Instant::now()),
-            "the next tick may look again"
+            inst.session_id_poller_retry_after.is_none(),
+            "fixture: this row has not reached a managed store, so it holds no deadline"
         );
+
+        // Four more walks must leave the delay at its first value: a walk that reached the
+        // start path would have doubled it.
+        for _ in 0..4 {
+            assert!(!inst.repair_session_id_poller_if_needed(&live));
+        }
+        assert_eq!(
+            inst.poller_repair.current_reprobe_delay(),
+            Some(std::time::Duration::from_secs(5))
+        );
+
+        // Once the window closes, the row is probed again.
+        inst.poller_repair.expire();
+        assert!(!inst.repair_session_id_poller_if_needed(&live));
+        assert!(!inst.poller_repair.due(std::time::Instant::now()));
     }
 
     #[test]
@@ -938,8 +1132,12 @@ mod tests {
         let settings = store.join("settings.json");
         std::fs::create_dir(&settings).unwrap();
         assert_eq!(inst.maybe_start_poller(), PollerStart::BudgetExhausted);
+        inst.poller_repair.expire();
         assert!(!inst.repair_session_id_poller_if_needed(&live));
-        assert!(!inst.poller_repair.due(std::time::Instant::now()));
+        assert!(
+            !inst.poller_repair.due(std::time::Instant::now()),
+            "an over-budget attempt schedules the next one"
+        );
         let lease = super::try_acquire_managed_capture_lease(backend, &store)
             .expect("budget rejection releases the store lease");
 
@@ -1349,7 +1547,11 @@ mod tests {
         // Present but not running, so the running check does not
         // short-circuit and the handle stays observable.
         inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(
-            crate::session::poller::SessionPoller::new("unstarted".to_string()),
+            crate::session::poller::SessionPoller::new(
+                "unstarted".to_string(),
+                "claude".to_string(),
+                None,
+            ),
         )));
 
         assert!(!inst.repair_session_id_poller_if_needed(&snapshot));
@@ -1606,7 +1808,9 @@ mod tests {
     /// The race #3880 describes: repair sees a live agent pane in its snapshot, the agent dies
     /// before `maybe_start_poller` re-queries tmux, and only the paired terminal answers.
     #[test]
+    #[serial_test::serial]
     fn repair_declines_when_the_agent_pane_dies_under_the_snapshot() {
+        let _isolated = crate::session::test_support::isolate_app_dir();
         let budget = crate::session::poller::test_support::IsolatedBudget::with_ceiling(1);
         let mut inst = Instance::new("term rewriting", "/tmp/agent-died-under-snapshot");
         inst.tool = "claude".to_string();
@@ -1636,10 +1840,61 @@ mod tests {
             "no poller on the wrong pane"
         );
         assert_eq!(budget.active(), 0, "a declined start takes no budget slot");
+        assert!(
+            !inst.poller_repair.due(std::time::Instant::now()),
+            "the decline is re-probed later: the live re-query that found no agent costs a fork"
+        );
+    }
+
+    /// A launch can replace the execution without tearing the poller down first. Reporting that
+    /// poller as this row's start would leave the row watching the launch it just gave up, and the
+    /// repair walk skips on a running poller, so nothing would ever replace it.
+    #[test]
+    fn a_start_does_not_report_another_execution_poller_as_started() {
+        let execution = || super::ActiveExecution {
+            launch_id: "launch-1".to_string(),
+            binding: crate::session::ExecutionBinding {
+                agent: "claude".into(),
+                stores: Vec::new(),
+                configuration: Vec::new(),
+                cwd: std::path::PathBuf::from("/tmp"),
+                cwd_filesystem: "host".into(),
+                filesystem: "host".into(),
+                exported_default_store: None,
+            },
+            capture: None,
+            container: None,
+        };
+        let mut inst = Instance::new("foreign-poller", "/tmp/foreign-poller");
+        let mut poller = crate::session::poller::SessionPoller::new(
+            format!("test-tmux-{}", inst.id),
+            inst.tool.clone(),
+            Some(execution()),
+        );
         assert_eq!(
-            inst.poller_repair,
-            Default::default(),
-            "nothing to poll is not a failed repair: the next tick looks again"
+            poller.start(inst.id.clone(), Box::new(|| None), Box::new(|_| {}), None,),
+            crate::session::poller::PollerSpawn::Spawned
+        );
+        let stale = std::sync::Arc::new(std::sync::Mutex::new(poller));
+        inst.session_id_poller = Some(stale.clone());
+        assert!(stale.lock().unwrap().is_running());
+        // The launch that replaced the execution installed none of its own.
+        inst.active_execution = Some(super::ActiveExecution {
+            launch_id: "launch-2".to_string(),
+            ..execution()
+        });
+
+        inst.maybe_start_poller();
+
+        assert!(
+            !stale.lock().unwrap().is_running(),
+            "the poller for the superseded launch is stopped, not adopted as this row's"
+        );
+        assert!(
+            inst.session_id_poller
+                .as_ref()
+                .is_none_or(|held| !std::sync::Arc::ptr_eq(held, &stale)),
+            "and the row's slot does not still hold it"
         );
     }
 }
